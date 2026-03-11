@@ -8,9 +8,29 @@ from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileToo
 from xagent.core.workspace import TaskWorkspace
 
 
+@pytest.fixture
+def mock_workspace_db(mocker):
+    """Mock database operations for workspace to avoid DB access in tests."""
+
+    # Mock _create_file_record to do nothing (avoid DB access)
+    def mock_create_record(self, file_id, file_path):
+        # Store file_id in cache for retrieval
+        path_str = str(file_path)
+        resolved_str = str(file_path.resolve())
+        self._recently_registered_files[path_str] = file_id
+        self._recently_registered_files[resolved_str] = file_id
+        self._file_id_to_path[file_id] = file_path
+
+    mocker.patch(
+        "xagent.core.workspace.TaskWorkspace._create_file_record", mock_create_record
+    )
+    return mocker
+
+
 class TestWorkspaceFileToolConsistency:
     """Test that write and read operations work consistently."""
 
+    @pytest.mark.usefixtures("mock_workspace_db")
     def test_write_then_read_consistency(self, tmp_path):
         """Test that a file written can be immediately read back."""
         # Create workspace
@@ -23,7 +43,8 @@ class TestWorkspaceFileToolConsistency:
 
         # Write file
         write_result = tools.write_file(test_filename, test_content)
-        assert write_result is True
+        assert write_result["success"] is True
+        assert isinstance(write_result.get("file_id"), str)
 
         # Verify file exists in output directory
         output_file = workspace.output_dir / test_filename
@@ -34,9 +55,11 @@ class TestWorkspaceFileToolConsistency:
         read_content = tools.read_file(test_filename)
         assert read_content == test_content
 
+    @pytest.mark.usefixtures("mock_workspace_db")
     def test_write_then_read_with_relative_path(self, tmp_path):
         """Test that relative paths work consistently."""
         workspace = TaskWorkspace("test_task", str(tmp_path))
+        # Manually set up the cache after workspace creation (mock runs after __init__)
         tools = WorkspaceFileTools(workspace)
 
         test_content = "Relative path test"
@@ -44,7 +67,8 @@ class TestWorkspaceFileToolConsistency:
 
         # Write file with relative path
         write_result = tools.write_file(test_filename, test_content)
-        assert write_result is True
+        assert write_result["success"] is True
+        assert isinstance(write_result.get("file_id"), str)
 
         # Verify file exists
         output_file = workspace.output_dir / "subdir" / "test_file.txt"
@@ -55,6 +79,7 @@ class TestWorkspaceFileToolConsistency:
         read_content = tools.read_file(test_filename)
         assert read_content == test_content
 
+    @pytest.mark.usefixtures("mock_workspace_db")
     def test_write_then_read_with_different_default_dirs(self, tmp_path):
         """Test that write and read use consistent default directories."""
         workspace = TaskWorkspace("test_task", str(tmp_path))
@@ -65,7 +90,8 @@ class TestWorkspaceFileToolConsistency:
 
         # Write to output directory (default for write_file)
         write_result = tools.write_file(test_filename, test_content)
-        assert write_result is True
+        assert write_result["success"] is True
+        assert isinstance(write_result.get("file_id"), str)
 
         # Read from output directory (should be default for read_file too)
         read_content = tools.read_file(test_filename)
@@ -86,6 +112,7 @@ class TestWorkspaceFileToolConsistency:
         ):
             tools.read_file("nonexistent.txt")
 
+    @pytest.mark.usefixtures("mock_workspace_db")
     def test_write_with_output_prefix(self, tmp_path):
         """Test that writing with 'output/' prefix doesn't create duplicate directories."""
         workspace = TaskWorkspace("test_task", str(tmp_path))
@@ -96,7 +123,8 @@ class TestWorkspaceFileToolConsistency:
         # Write with output/ prefix - should go to workspace/output/banner.html
         # NOT workspace/output/output/banner.html
         write_result = tools.write_file("output/banner.html", test_content)
-        assert write_result is True
+        assert write_result["success"] is True
+        assert isinstance(write_result.get("file_id"), str)
 
         # Verify file is in workspace/output/banner.html
         expected_file = workspace.output_dir / "banner.html"
@@ -111,6 +139,7 @@ class TestWorkspaceFileToolConsistency:
         # Verify content is correct
         assert expected_file.read_text() == test_content
 
+    @pytest.mark.usefixtures("mock_workspace_db")
     def test_write_with_input_prefix(self, tmp_path):
         """Test that writing with 'input/' prefix works correctly."""
         workspace = TaskWorkspace("test_task", str(tmp_path))
@@ -120,13 +149,15 @@ class TestWorkspaceFileToolConsistency:
 
         # Write with input/ prefix
         write_result = tools.write_file("input/data.txt", test_content)
-        assert write_result is True
+        assert write_result["success"] is True
+        assert isinstance(write_result.get("file_id"), str)
 
         # Verify file is in workspace/input/data.txt
         expected_file = workspace.input_dir / "data.txt"
         assert expected_file.exists()
         assert expected_file.read_text() == test_content
 
+    @pytest.mark.usefixtures("mock_workspace_db")
     def test_write_with_temp_prefix(self, tmp_path):
         """Test that writing with 'temp/' prefix works correctly."""
         workspace = TaskWorkspace("test_task", str(tmp_path))
@@ -136,12 +167,36 @@ class TestWorkspaceFileToolConsistency:
 
         # Write with temp/ prefix
         write_result = tools.write_file("temp/cache.txt", test_content)
-        assert write_result is True
+        assert write_result["success"] is True
+        assert isinstance(write_result.get("file_id"), str)
 
-        # Verify file is in workspace/temp/cache.txt
         expected_file = workspace.temp_dir / "cache.txt"
         assert expected_file.exists()
         assert expected_file.read_text() == test_content
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_by_file_id(self, tmp_path):
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        test_content = "Read by file_id"
+        result = tools.write_file("output/read_by_id.txt", test_content)
+        file_id = result["file_id"]
+
+        read_content = tools.read_file(file_id)
+        assert read_content == test_content
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_read_by_file_link_prefix(self, tmp_path):
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        test_content = "Read by file:file_id"
+        result = tools.write_file("output/read_by_link_id.txt", test_content)
+        file_id = result["file_id"]
+
+        read_content = tools.read_file(f"file:{file_id}")
+        assert read_content == test_content
 
 
 if __name__ == "__main__":

@@ -5,14 +5,20 @@ This module provides workspace management that supports multiple concurrent agen
 ensuring that each agent has its own isolated workspace context.
 """
 
+import contextvars
 import logging
 import os
 import shutil
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
+
+# Context variable for auto-registration mode
+_auto_register = contextvars.ContextVar("_auto_register", default=False)
 
 
 @dataclass
@@ -44,6 +50,9 @@ class TaskWorkspace:
     ):
         self.id = id
         self.base_dir = Path(base_dir)
+        self.db_session = None  # Optional database session for file registration
+        self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
+        self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
 
         # Create workspace directory
         self.workspace_dir = self.base_dir / id
@@ -65,6 +74,175 @@ class TaskWorkspace:
 
         # Create directory structure
         self._ensure_directories()
+
+    def register_file(self, file_path: str, file_id: Optional[str] = None) -> str:
+        resolved_path = self.resolve_path(file_path, default_dir="output")
+        if not resolved_path.exists() or not resolved_path.is_file():
+            raise FileNotFoundError(f"File not found for registration: {file_path}")
+
+        workspace_abs = self.workspace_dir.resolve()
+        try:
+            resolved_path.relative_to(workspace_abs)
+        except ValueError as exc:
+            raise ValueError(f"Path {file_path} is outside workspace") from exc
+
+        # Check if file already exists in database
+        existing_file_id = self._get_file_id_from_db(resolved_path)
+        if existing_file_id:
+            return existing_file_id
+
+        # Generate new file_id if not provided
+        final_file_id = str(file_id).strip() if file_id else ""
+        if not final_file_id:
+            final_file_id = str(uuid4())
+
+        # Create database record
+        self._create_file_record(final_file_id, resolved_path)
+
+        return final_file_id
+
+    def _create_file_record(self, file_id: str, file_path: Path) -> None:
+        """Create UploadedFile record in database"""
+        from .storage.manager import create_db_session
+
+        # Use provided session or create temporary one
+        db = self.db_session if self.db_session else create_db_session()
+        should_close = self.db_session is None
+
+        try:
+            from ..web.models.task import Task
+            from ..web.models.uploaded_file import UploadedFile
+
+            # Check if record already exists
+            existing = (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+            )
+            if existing:
+                return
+
+            # Extract task_id from workspace id (e.g., 'web_task_265' -> 265)
+            # Handle test environment workspaces (e.g., 'test_task')
+            try:
+                task_id = int(self.id.split("_")[-1])
+            except (ValueError, IndexError):
+                # Not a valid task ID, likely a test workspace
+                # Skip database registration in test environments
+                logger.debug(
+                    f"Skipping database registration for test workspace '{self.id}', file_id={file_id}"
+                )
+                return
+
+            # Get user_id from task
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if not task:
+                logger.warning(f"Task {task_id} not found, cannot create file record")
+                return
+
+            # Guess MIME type
+            import mimetypes
+
+            mime_type, _ = mimetypes.guess_type(file_path.name)
+            if not mime_type:
+                mime_type = "application/octet-stream"
+
+            # Create file record
+            file_record = UploadedFile(
+                file_id=file_id,
+                user_id=task.user_id,
+                task_id=task_id,
+                filename=file_path.name,
+                storage_path=str(file_path),
+                mime_type=mime_type,
+                file_size=file_path.stat().st_size,
+            )
+            db.add(file_record)
+            if should_close:
+                db.commit()
+            else:
+                db.flush()
+            logger.info(f"Created file record: file_id={file_id}, task_id={task_id}")
+        except Exception as e:
+            logger.error(f"Failed to create file record: {e}")
+            if should_close:
+                db.rollback()
+            raise  # Re-raise so caller knows registration failed
+        finally:
+            if should_close:
+                db.close()
+
+    def _get_file_id_from_db(self, file_path: Path) -> Optional[str]:
+        """Get file_id from database by file path."""
+        from .storage.manager import create_db_session
+
+        try:
+            from ..web.models.uploaded_file import UploadedFile
+
+            db = create_db_session()
+            try:
+                record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.storage_path == str(file_path))
+                    .first()
+                )
+                if record:
+                    return str(record.file_id)
+                return None
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"Failed to query file_id from database: {e}")
+            return None
+
+    def get_registered_file_id(self, file_path: str) -> Optional[str]:
+        try:
+            resolved_path = self.resolve_path(file_path, default_dir="output")
+            return self._get_file_id_from_db(resolved_path)
+        except Exception:
+            return None
+
+    def resolve_file_id(self, file_id: str) -> Optional[Path]:
+        file_id = str(file_id).strip()
+        if not file_id:
+            return None
+
+        # Check in-memory cache first
+        if file_id in self._file_id_to_path:
+            cached_path = self._file_id_to_path[file_id]
+            if cached_path.exists():
+                logger.debug(
+                    f"resolve_file_id: Found in cache: {file_id} -> {cached_path}"
+                )
+                return cached_path
+            else:
+                logger.warning(
+                    f"resolve_file_id: Cached path doesn't exist: {cached_path}"
+                )
+                # Remove stale cache entry
+                del self._file_id_to_path[file_id]
+
+        # Query from database
+        from .storage.manager import create_db_session
+
+        try:
+            from ..web.models.uploaded_file import UploadedFile
+
+            db = create_db_session()
+            try:
+                record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == file_id)
+                    .first()
+                )
+                if record and record.storage_path:
+                    resolved_path = Path(record.storage_path)
+                    if resolved_path.exists() and resolved_path.is_file():
+                        return resolved_path
+                return None
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning(f"Failed to resolve file_id from database: {e}")
+            return None
 
     def _ensure_directories(self) -> None:
         """Ensure all workspace directories exist"""
@@ -152,7 +330,19 @@ class TaskWorkspace:
             ValueError: If path is outside both workspace and allowed external directories
             FileNotFoundError: If relative path doesn't exist in any searched directory
         """
-        path = Path(file_path)
+        normalized_input = file_path.strip()
+        if normalized_input.startswith("file:") and not normalized_input.startswith(
+            "file://"
+        ):
+            normalized_input = normalized_input[5:].strip()
+
+        path = Path(normalized_input)
+
+        file_id_candidate = normalized_input
+        if file_id_candidate and len(path.parts) == 1 and "/" not in file_id_candidate:
+            resolved_by_id = self.resolve_file_id(file_id_candidate)
+            if resolved_by_id is not None:
+                return resolved_by_id
 
         if path.is_absolute():
             # For absolute paths, verify it's within workspace or allowed external directories
@@ -270,10 +460,17 @@ class TaskWorkspace:
         return result
 
     def _get_file_info(self, file_path: Path, location: str) -> Dict[str, Any]:
-        """Get file information for a given path"""
+        """Get file information for a given path.
+
+        Note: file_id will be None if the file is not registered in the database.
+        Callers should handle this case appropriately.
+        """
         stat = file_path.stat()
+        # Get file_id from cache or DB (None if not registered)
+        file_id = self.get_file_id_from_path(str(file_path))
 
         return {
+            "file_id": file_id,
             "file_path": str(file_path),
             "relative_path": str(file_path.relative_to(self.workspace_dir)),
             "location": location,
@@ -328,6 +525,98 @@ class TaskWorkspace:
         target_path = target_dir / source.name
         shutil.copy2(source, target_path)
         return target_path
+
+    @contextmanager
+    def auto_register_files(self) -> "Iterator[TaskWorkspace]":
+        """
+        Context manager to automatically register files created during execution.
+
+        Usage:
+            with workspace.auto_register_files():
+                # All files created here will be automatically registered
+                write_file("test.txt", "content")
+                process_and_save_image("output.png")
+
+        This is safer than relying on manual register_file() calls.
+        """
+        # Scan files before operation
+        files_before = self._scan_all_files()
+
+        try:
+            yield self
+        finally:
+            # Scan files after operation and register new ones
+            files_after = self._scan_all_files()
+            new_files = files_after - files_before
+
+            for file_path in new_files:
+                try:
+                    file_id = self.register_file(str(file_path))
+                    # Store path -> file_id mapping
+                    path_str = str(file_path)
+                    resolved_str = str(file_path.resolve())
+                    self._recently_registered_files[path_str] = file_id
+                    self._recently_registered_files[resolved_str] = file_id
+                    # Store file_id -> path reverse mapping
+                    self._file_id_to_path[file_id] = file_path
+                    logger.debug(f"Auto-registered file: {file_path} -> {file_id}")
+                except Exception as e:
+                    # Don't generate fake file_id - file will need to be backfilled later
+                    logger.error(
+                        f"Failed to auto-register file {file_path}: {e}. "
+                        f"File exists on disk but is not in database - will require backfill."
+                    )
+
+    def _scan_all_files(self) -> set[Path]:
+        """Scan all files in workspace and return as set."""
+        files: set[Path] = set()
+        if not self.workspace_dir.exists():
+            return files
+
+        for file_path in self.workspace_dir.rglob("*"):
+            if file_path.is_file():
+                # Skip hidden files and cache directories
+                if any(part.startswith(".") for part in file_path.parts):
+                    continue
+                if (
+                    "__pycache__" in file_path.parts
+                    or "node_modules" in file_path.parts
+                ):
+                    continue
+                files.add(file_path)
+        return files
+
+    def get_file_id_from_path(self, file_path: str) -> Optional[str]:
+        """Get file_id from file path using database or in-memory cache."""
+        try:
+            resolved_path = Path(file_path).resolve()
+            resolved_str = str(resolved_path)
+
+            # Check in-memory cache first (for files just registered)
+            logger.debug(f"get_file_id_from_path: Looking for {resolved_str}")
+            logger.debug(
+                f"get_file_id_from_path: Cache has {len(self._recently_registered_files)} entries: {list(self._recently_registered_files.keys())}"
+            )
+
+            if resolved_str in self._recently_registered_files:
+                logger.debug(
+                    f"get_file_id_from_path: Found in cache: {self._recently_registered_files[resolved_str]}"
+                )
+                return self._recently_registered_files[resolved_str]
+
+            # Also try the original path (not resolved)
+            if file_path in self._recently_registered_files:
+                logger.debug(
+                    f"get_file_id_from_path: Found in cache with original path: {self._recently_registered_files[file_path]}"
+                )
+                return self._recently_registered_files[file_path]
+
+            logger.debug("get_file_id_from_path: Not found in cache, checking DB")
+            # Fall back to database query
+            return self._get_file_id_from_db(resolved_path)
+        except Exception as e:
+            logger.warning(f"get_file_id_from_path: Exception: {e}")
+            return None
 
     def __enter__(self) -> "TaskWorkspace":
         """Context manager entry"""
@@ -523,6 +812,21 @@ class MockWorkspace:
             return self.temp_dir / file_path
         else:
             return self.workspace_dir / file_path
+
+    def register_file(self, file_path: str, file_id: Optional[str] = None) -> str:
+        """
+        Mock register_file - returns a UUID without creating database record.
+
+        Args:
+            file_path: Virtual file path
+            file_id: Optional file ID
+
+        Returns:
+            A UUID string
+        """
+        from uuid import uuid4
+
+        return str(file_id).strip() if file_id else str(uuid4())
 
     def __repr__(self) -> str:
         return f"MockWorkspace(id='{self.id}', path='{self.workspace_dir}')"

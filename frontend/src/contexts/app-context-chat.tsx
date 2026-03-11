@@ -295,13 +295,14 @@ interface AppState {
   taskId: number | null
   filePreview: {
     isOpen: boolean
-    filePath: string
+    fileId: string
     fileName: string
     content: string
+    mimeType?: string
     isLoading: boolean
     error: string | null
     // Support switching between multiple file previews
-    availableFiles: Array<{ filePath: string; fileName: string }>
+    availableFiles: Array<{ fileId: string; fileName: string }>
     currentIndex: number
   }
   isReplaying: boolean
@@ -341,10 +342,10 @@ type AppAction =
   | { type: "SET_PROCESSING"; payload: boolean }
   | { type: "CLEAR_MESSAGES"; payload?: { keepMessageId?: string | null } }
   | { type: "RESET_STATE" }
-  | { type: "OPEN_FILE_PREVIEW"; payload: { filePath: string; fileName: string; files?: Array<{ filePath: string; fileName: string }>; index?: number } }
+  | { type: "OPEN_FILE_PREVIEW"; payload: { fileId: string; fileName: string; files?: Array<{ fileId: string; fileName: string }>; index?: number } }
   | { type: "CLOSE_FILE_PREVIEW" }
-  | { type: "SWITCH_FILE_PREVIEW"; payload: { filePath: string; fileName: string; index: number } }
-  | { type: "SET_FILE_PREVIEW_CONTENT"; payload: { content: string; error: string | null } }
+  | { type: "SWITCH_FILE_PREVIEW"; payload: { fileId: string; fileName: string; index: number } }
+  | { type: "SET_FILE_PREVIEW_CONTENT"; payload: { content: string; mimeType?: string; error: string | null } }
   | { type: "SET_FILE_PREVIEW_LOADING"; payload: boolean }
   | { type: "START_REPLAY"; payload: { taskId: number; events: TraceEvent[] } }
   | { type: "STOP_REPLAY" }
@@ -371,7 +372,7 @@ const initialState: AppState = {
   taskId: null,
   filePreview: {
     isOpen: false,
-    filePath: '',
+    fileId: '',
     fileName: '',
     content: '',
     isLoading: false,
@@ -551,7 +552,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
 
     case "OPEN_FILE_PREVIEW":
       // Support passing single file or multiple file list
-      const files = action.payload.files || [{ filePath: action.payload.filePath, fileName: action.payload.fileName }]
+      const files = action.payload.files || [{ fileId: action.payload.fileId, fileName: action.payload.fileName }]
       const currentIndex = action.payload.index || 0
 
       return {
@@ -559,7 +560,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         filePreview: {
           ...state.filePreview,
           isOpen: true,
-          filePath: files[currentIndex]?.filePath || action.payload.filePath,
+          fileId: files[currentIndex]?.fileId || action.payload.fileId,
           fileName: files[currentIndex]?.fileName || action.payload.fileName,
           content: '',
           isLoading: true,
@@ -584,7 +585,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         ...state,
         filePreview: {
           ...state.filePreview,
-          filePath: action.payload.filePath,
+          fileId: action.payload.fileId,
           fileName: action.payload.fileName,
           content: '',
           isLoading: true,
@@ -599,6 +600,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         filePreview: {
           ...state.filePreview,
           content: action.payload.content,
+          mimeType: action.payload.mimeType,
           error: action.payload.error,
           isLoading: false,
         }
@@ -721,7 +723,7 @@ interface AppContextType {
   connectionError: Error | null
   setTaskId: (taskId: number | null) => void
   requestStatus: () => void
-  openFilePreview: (filePath: string, fileName: string, files?: Array<{ filePath: string; fileName: string }>, index?: number) => void
+  openFilePreview: (fileId: string, fileName: string, files?: Array<{ fileId: string; fileName: string }>, index?: number) => void
   switchFilePreview: (index: number) => void
   closeFilePreview: () => void
   startReplay: (taskId: number, events: TraceEvent[]) => void
@@ -1097,13 +1099,22 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                     files={files}
                     variant="user-message"
                     onPreview={(file) => {
+                      const currentFileId = file.file_id || ""
+                      const normalizedFiles = files.map((f: any) => ({
+                        fileId: f.file_id || "",
+                        fileName: f.name,
+                      })).filter((item: { fileId: string }) => !!item.fileId)
+
+                      if (!currentFileId) {
+                        return
+                      }
                       dispatch({
                         type: "OPEN_FILE_PREVIEW",
                         payload: {
-                          filePath: file.path || "",
+                          fileId: currentFileId,
                           fileName: file.name,
-                          files: files.map((f: any) => ({ filePath: f.path || "", fileName: f.name })),
-                          index: files.findIndex((f: any) => f.path === file.path)
+                          files: normalizedFiles,
+                          index: normalizedFiles.findIndex((f: any) => f.fileId === currentFileId)
                         }
                       })
                     }}
@@ -2183,15 +2194,12 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   <div className="mt-2 space-y-1">
                     {fileOutputsData.map((file: string | any, index: number) => {
                       let fileName, filePath
-                      if (typeof file === 'string') {
-                        fileName = file.split('/').pop() || file
-                        filePath = file
-                      } else if (typeof file === 'object' && file !== null) {
-                        fileName = file.filename || file.file_path?.split('/').pop() || 'unknown'
-                        filePath = file.download_path || file.download_url || file.file_path || file.relative_path || fileName
+                      if (typeof file === 'object' && file !== null) {
+                        fileName = file.filename || 'unknown'
+                        filePath = file.file_id || ''
                       } else {
                         fileName = 'unknown'
-                        filePath = 'unknown'
+                        filePath = ''
                       }
 
                       return (
@@ -2202,20 +2210,21 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                               // Dispatch custom event to open file preview with all files
                               const allFiles = fileOutputsData.map((file: string | any) => {
                                 let fFileName, fFilePath
-                                if (typeof file === 'string') {
-                                  fFileName = file.split('/').pop() || file
-                                  fFilePath = file
-                                } else if (typeof file === 'object' && file !== null) {
-                                  fFileName = file.filename || file.file_path?.split('/').pop() || 'unknown'
-                                  fFilePath = file.download_path || file.download_url || file.file_path || file.relative_path || fFileName
+                                if (typeof file === 'object' && file !== null) {
+                                  fFileName = file.filename || 'unknown'
+                                  fFilePath = file.file_id || ''
                                 } else {
                                   fFileName = 'unknown'
-                                  fFilePath = 'unknown'
+                                  fFilePath = ''
                                 }
-                                return { fileName: fFileName, filePath: fFilePath }
-                              })
+                                return { fileName: fFileName, fileId: fFilePath }
+                              }).filter((item: { fileId: string }) => !!item.fileId)
 
-                                window.dispatchEvent(new CustomEvent('openFilePreview', {
+                              if (!filePath) {
+                                return
+                              }
+
+                              window.dispatchEvent(new CustomEvent('openFilePreview', {
                                 detail: {
                                   filePath,
                                   fileName,
@@ -2224,6 +2233,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                                 }
                               }))
                             }}
+                            disabled={!filePath}
                             className="text-xs bg-primary/10 hover:bg-primary/20 text-primary px-2 py-1 rounded transition-colors"
                           >
                             {t('agent.logs.event.messages.previewLabel')}
@@ -3276,15 +3286,12 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                     <div className="mt-2 space-y-1">
                 {taskData.file_outputs.map((file: string | any, index: number) => {
                   let fileName, filePath
-                  if (typeof file === 'string') {
-                    fileName = file.split('/').pop() || file
-                    filePath = file
-                  } else if (typeof file === 'object' && file !== null) {
-                    fileName = file.filename || file.file_path?.split('/').pop() || 'unknown'
-                    filePath = file.download_path || file.download_url || file.file_path || file.relative_path || fileName
+                  if (typeof file === 'object' && file !== null) {
+                    fileName = file.filename || 'unknown'
+                    filePath = file.file_id || ''
                   } else {
                     fileName = 'unknown'
-                    filePath = 'unknown'
+                    filePath = ''
                   }
 
                   return (
@@ -3295,20 +3302,21 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                           // Dispatch custom event to open file preview with all files
                           const allFiles = (taskData.file_outputs || []).map((file: string | any) => {
                             let fFileName, fFilePath
-                            if (typeof file === 'string') {
-                              fFileName = file.split('/').pop() || file
-                              fFilePath = file
-                            } else if (typeof file === 'object' && file !== null) {
-                              fFileName = file.filename || file.file_path?.split('/').pop() || 'unknown'
-                              fFilePath = file.download_path || file.download_url || file.file_path || file.relative_path || fFileName
+                            if (typeof file === 'object' && file !== null) {
+                              fFileName = file.filename || 'unknown'
+                              fFilePath = file.file_id || ''
                             } else {
                               fFileName = 'unknown'
-                              fFilePath = 'unknown'
+                              fFilePath = ''
                             }
-                            return { fileName: fFileName, filePath: fFilePath }
-                          })
+                            return { fileName: fFileName, fileId: fFilePath }
+                          }).filter((item: { fileId: string }) => !!item.fileId)
 
-                            window.dispatchEvent(new CustomEvent('openFilePreview', {
+                          if (!filePath) {
+                            return
+                          }
+
+                          window.dispatchEvent(new CustomEvent('openFilePreview', {
                             detail: {
                               filePath,
                               fileName,
@@ -3317,6 +3325,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                             }
                           }))
                         }}
+                        disabled={!filePath}
                         className="text-xs bg-primary/10 hover:bg-primary/20 text-primary px-2 py-1 rounded transition-colors"
                       >
                         {t('agent.logs.event.messages.previewLabel')}
@@ -3777,22 +3786,22 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     }
   }, [router])
 
-  const openFilePreview = useCallback((filePath: string, fileName: string, files?: Array<{ filePath: string; fileName: string }>, index?: number) => {
+  const openFilePreview = useCallback((fileId: string, fileName: string, files?: Array<{ fileId: string; fileName: string }>, index?: number) => {
     console.log('🎯 openFilePreview called:', {
-      filePath,
+      fileId,
       fileName,
       files: files,
       filesLength: files?.length,
       index
     })
-    dispatch({ type: "OPEN_FILE_PREVIEW", payload: { filePath, fileName, files, index } })
+    dispatch({ type: "OPEN_FILE_PREVIEW", payload: { fileId, fileName, files, index } })
   }, [])
 
   const switchFilePreview = useCallback((index: number) => {
     const { availableFiles } = state.filePreview
     if (index >= 0 && index < availableFiles.length) {
       const file = availableFiles[index]
-      dispatch({ type: "SWITCH_FILE_PREVIEW", payload: { filePath: file.filePath, fileName: file.fileName, index } })
+      dispatch({ type: "SWITCH_FILE_PREVIEW", payload: { fileId: file.fileId, fileName: file.fileName, index } })
     }
   }, [state.filePreview.availableFiles])
 

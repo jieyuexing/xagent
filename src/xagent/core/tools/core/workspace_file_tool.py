@@ -275,7 +275,7 @@ class WorkspaceFileOperations:
         content: str,
         encoding: str = "utf-8",
         create_dirs: bool = True,
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """Write file content in workspace"""
         logger.debug(
             "write_file called with file_path: %s, content_length: %d, workspace_id: %s",
@@ -291,12 +291,26 @@ class WorkspaceFileOperations:
             logger.debug("Creating parent directories for: %s", resolved_path.parent)
             resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.debug("Writing %d bytes to: %s", len(content), resolved_path)
-        with open(resolved_path, "w", encoding=encoding) as f:
-            f.write(content)
+        # Use auto_register context to automatically register files
+        with self.workspace.auto_register_files():
+            logger.debug("Writing %d bytes to: %s", len(content), resolved_path)
+            with open(resolved_path, "w", encoding=encoding) as f:
+                f.write(content)
 
-        logger.debug("Successfully wrote file: %s", resolved_path)
-        return True
+        file_id = self.workspace.get_file_id_from_path(str(resolved_path))
+
+        logger.debug(
+            "Successfully wrote file: %s with file_id: %s", resolved_path, file_id
+        )
+        return {
+            "success": True,
+            "file_id": file_id,
+            "filename": resolved_path.name,
+            "relative_path": str(
+                resolved_path.relative_to(self.workspace.workspace_dir)
+            ),
+            "file_path": str(resolved_path),
+        }
 
     def append_file(
         self,
@@ -667,7 +681,8 @@ def workspace_write_file(
         True if the write operation was successful.
     """
     ops = _get_workspace_ops(workspace_id)
-    return ops.write_file(file_path, content, encoding, create_dirs)
+    result = ops.write_file(file_path, content, encoding, create_dirs)
+    return bool(result.get("success", False))
 
 
 def workspace_list_files(

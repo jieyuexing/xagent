@@ -53,18 +53,7 @@ export function MarkdownRenderer({ content, className = '', onFileClick }: Markd
             const filePath = href.replace(/^file:/, '')
             const apiUrl = getApiUrl()
 
-            // Extract task_id from filePath (e.g., "web_task_158/output/file.png" -> "158")
-            const taskIdMatch = filePath.match(/web_task_(\d+)/)
-            const taskId = taskIdMatch ? taskIdMatch[1] : null
-
-            let imageUrl: string
-            if (taskId) {
-              // Use public preview API (no auth required)
-              imageUrl = `${apiUrl}/api/files/public/preview/${taskId}/${encodeURIComponent(filePath)}`
-            } else {
-              // Fallback to download API (requires auth, won't work in img tag)
-              imageUrl = `${apiUrl}/api/files/download/${encodeURIComponent(filePath)}`
-            }
+            const imageUrl = `${apiUrl}/api/files/public/preview/${encodeURIComponent(filePath)}`
 
             // Also add data-file-path for click preview
             return `<img src="${imageUrl}" alt="${text || ''}" title="${title || text || ''}" data-file-path="${filePath}" class="file-image cursor-pointer" />`
@@ -100,8 +89,11 @@ export function MarkdownRenderer({ content, className = '', onFileClick }: Markd
         e.preventDefault()
         const filePath = link.getAttribute('data-file-path')
         if (filePath) {
-          // Extract filename from path
-          const fileName = filePath.split('/').pop() || filePath
+          const fileName =
+            link.textContent?.trim() ||
+            link.getAttribute('title') ||
+            filePath.split('/').pop() ||
+            filePath
           onFileClick(filePath, fileName)
         }
         return
@@ -113,7 +105,8 @@ export function MarkdownRenderer({ content, className = '', onFileClick }: Markd
         e.preventDefault()
         const filePath = img.getAttribute('data-file-path')
         if (filePath) {
-          // Extract filename from path
+          // Extract just the filename from the path, not the full path
+          // This ensures fileName is like "image.jpeg" not "web_task_235/output/image.jpeg"
           const fileName = filePath.split('/').pop() || filePath
           onFileClick(filePath, fileName)
         }

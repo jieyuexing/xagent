@@ -7,12 +7,26 @@ import re
 import unicodedata
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, cast
+from urllib.parse import unquote
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from ..auth_dependencies import get_user_from_websocket_token
+from ..config import UPLOADS_DIR
+from ..models.database import get_db
+from ..models.task import Task
+from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..timeout_manager import timeout_manager
 from ..tools.config import WebToolConfig
@@ -67,6 +81,23 @@ def normalize_filename(filename: str) -> str:
     return normalized_name
 
 
+def build_unique_target_path(target_dir: Any, filename: str) -> Any:
+    from pathlib import Path
+
+    base_path = Path(target_dir) / filename
+    if not base_path.exists():
+        return base_path
+
+    stem = base_path.stem
+    suffix = base_path.suffix
+    counter = 1
+    while True:
+        candidate = base_path.parent / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
 def create_stream_event(
     event_type: str,
     task_id: int,
@@ -104,6 +135,325 @@ def convert_to_local_time(utc_dt: Any) -> datetime:
     local_dt = utc_dt.astimezone()
     # Remove timezone info to avoid frontend confusion
     return local_dt.replace(tzinfo=None)  # type: ignore[no-any-return]
+
+
+def _build_output_file_id(relative_path: str) -> str:
+    del relative_path
+    return str(uuid.uuid4())
+
+
+def _resolve_output_storage_path(raw_path: str) -> Optional[tuple[Any, str]]:
+    if not raw_path:
+        return None
+
+    path_candidate = Path(raw_path)
+    if path_candidate.exists() and path_candidate.is_file():
+        resolved = path_candidate.resolve()
+    else:
+        resolved = (UPLOADS_DIR / raw_path.lstrip("/")).resolve()
+        if not resolved.exists() or not resolved.is_file():
+            return None
+
+    uploads_root = UPLOADS_DIR.resolve()
+    try:
+        relative_path = str(resolved.relative_to(uploads_root))
+    except ValueError:
+        return None
+
+    return resolved, relative_path
+
+
+def _resolve_legacy_preview_storage_path(raw_path: str) -> Optional[tuple[Path, str]]:
+    candidates: list[str] = []
+
+    def _append_candidate(value: str) -> None:
+        normalized = value.strip()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    _append_candidate(raw_path)
+    _append_candidate(unquote(raw_path))
+
+    current = list(candidates)
+    for candidate in current:
+        for prefix in ("file:", "/preview/", "preview/", "/uploads/", "uploads/"):
+            if candidate.startswith(prefix):
+                _append_candidate(candidate[len(prefix) :])
+
+    for candidate in candidates:
+        resolved = _resolve_output_storage_path(candidate)
+        if resolved is not None:
+            resolved_path, relative_path = resolved
+            return Path(resolved_path), relative_path
+
+    for candidate in candidates:
+        normalized = candidate.lstrip("/")
+        if not normalized:
+            continue
+        glob_matches = list(UPLOADS_DIR.glob(f"user_*/{normalized}"))
+        if glob_matches:
+            resolved_path = glob_matches[0].resolve()
+            relative_path = str(resolved_path.relative_to(UPLOADS_DIR.resolve()))
+            return resolved_path, relative_path
+
+    return None
+
+
+def _infer_owner_from_relative_path(
+    db: Session, relative_path: str
+) -> Optional[tuple[int, Optional[int]]]:
+    path_parts = Path(relative_path).parts
+    if not path_parts:
+        return None
+
+    user_id: Optional[int] = None
+    task_id: Optional[int] = None
+
+    first = path_parts[0]
+    remaining = path_parts[1:] if len(path_parts) > 1 else []
+
+    if first.startswith("user_"):
+        try:
+            user_id = int(first.replace("user_", "", 1))
+        except ValueError:
+            return None
+        if remaining:
+            task_segment = remaining[0]
+            if task_segment.startswith("web_task_"):
+                try:
+                    task_id = int(task_segment.replace("web_task_", "", 1))
+                except ValueError:
+                    task_id = None
+            elif task_segment.startswith("task_"):
+                try:
+                    task_id = int(task_segment.replace("task_", "", 1))
+                except ValueError:
+                    task_id = None
+        return user_id, task_id
+
+    if first.startswith("web_task_"):
+        try:
+            task_id = int(first.replace("web_task_", "", 1))
+        except ValueError:
+            return None
+    elif first.startswith("task_"):
+        try:
+            task_id = int(first.replace("task_", "", 1))
+        except ValueError:
+            return None
+
+    if task_id is not None:
+        task_row = db.query(Task).filter(Task.id == task_id).first()
+        if task_row and getattr(task_row, "user_id", None) is not None:
+            return int(getattr(task_row, "user_id")), task_id
+
+    return None
+
+
+def _map_link_token_to_file_id(
+    token: str, path_to_file_id: Dict[str, str]
+) -> Optional[str]:
+    raw = token.strip()
+    if not raw:
+        return None
+
+    direct_candidates = [
+        raw,
+        raw.lstrip("/"),
+        raw.replace("%2F", "/").lstrip("/"),
+        unquote(raw),
+    ]
+
+    expanded_candidates: list[str] = []
+    for candidate in direct_candidates:
+        if not candidate:
+            continue
+        if candidate not in expanded_candidates:
+            expanded_candidates.append(candidate)
+        if candidate.startswith("file:"):
+            stripped = candidate[5:].lstrip("/")
+            if stripped and stripped not in expanded_candidates:
+                expanded_candidates.append(stripped)
+        for prefix in ("preview/", "/preview/", "uploads/", "/uploads/"):
+            if candidate.startswith(prefix):
+                stripped = candidate[len(prefix) :].lstrip("/")
+                if stripped and stripped not in expanded_candidates:
+                    expanded_candidates.append(stripped)
+
+    for candidate in expanded_candidates:
+        mapped = path_to_file_id.get(candidate)
+        if mapped:
+            return mapped
+    return None
+
+
+def _rewrite_file_links_to_file_id(
+    output_text: Any, path_to_file_id: Dict[str, str]
+) -> Any:
+    if not isinstance(output_text, str) or not output_text:
+        return output_text
+
+    def replace_link(match: re.Match[str]) -> str:
+        token = match.group(1).strip()
+        mapped_file_id = _map_link_token_to_file_id(token, path_to_file_id)
+        if mapped_file_id:
+            return f"(file:{mapped_file_id})"
+        return match.group(0)
+
+    def replace_legacy_link(match: re.Match[str]) -> str:
+        token = match.group(1).strip()
+        mapped_file_id = _map_link_token_to_file_id(token, path_to_file_id)
+        if mapped_file_id:
+            return f"(file:{mapped_file_id})"
+        return match.group(0)
+
+    rewritten_output = re.sub(r"\(file:([^)]+)\)", replace_link, output_text)
+    rewritten_output = re.sub(
+        r"\(((?:/?preview|/?uploads)/[^)\s]+)\)",
+        replace_legacy_link,
+        rewritten_output,
+    )
+    return rewritten_output
+
+
+def _normalize_file_outputs(
+    db: Session,
+    task_id: int,
+    task_user_id: int,
+    file_outputs: Any,
+) -> tuple[list[Dict[str, str]], Dict[str, str]]:
+    from ..models.uploaded_file import UploadedFile
+
+    if isinstance(file_outputs, str):
+        file_outputs = [file_outputs] if file_outputs.strip() else []
+    if not isinstance(file_outputs, list):
+        return [], {}
+
+    normalized_outputs: list[Dict[str, str]] = []
+    path_to_file_id: Dict[str, str] = {}
+    changed = False
+
+    for item in file_outputs:
+        item_file_id = ""
+        item_filename = ""
+        raw_paths: list[str] = []
+
+        if isinstance(item, str):
+            raw_paths = [item]
+        elif isinstance(item, dict):
+            if isinstance(item.get("file_id"), str):
+                item_file_id = str(item.get("file_id"))
+            if isinstance(item.get("filename"), str):
+                item_filename = str(item.get("filename"))
+            for key in ("file_path", "download_path", "relative_path", "path"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    raw_paths.append(value)
+        else:
+            continue
+
+        resolved_info = None
+        for raw_path in raw_paths:
+            resolved_info = _resolve_output_storage_path(raw_path)
+            if resolved_info is not None:
+                break
+
+        if resolved_info is None:
+            if item_file_id:
+                normalized_outputs.append(
+                    {
+                        "file_id": item_file_id,
+                        "filename": item_filename or "output",
+                    }
+                )
+            continue
+
+        resolved_path, relative_path = resolved_info
+        normalized_relative_path = relative_path.lstrip("/")
+        expected_file_id = item_file_id or _build_output_file_id(
+            normalized_relative_path
+        )
+
+        file_record = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.storage_path == str(resolved_path))
+            .first()
+        )
+        if file_record is None and item_file_id:
+            file_record = (
+                db.query(UploadedFile)
+                .filter(UploadedFile.file_id == item_file_id)
+                .first()
+            )
+
+        if file_record is None:
+            file_record = UploadedFile(
+                file_id=expected_file_id,
+                user_id=task_user_id,
+                task_id=task_id,
+                filename=item_filename or resolved_path.name,
+                storage_path=str(resolved_path),
+                mime_type=None,
+                file_size=int(resolved_path.stat().st_size),
+            )
+            db.add(file_record)
+            db.flush()
+            changed = True
+
+        final_file_id = str(file_record.file_id)
+        final_filename = item_filename or str(file_record.filename)
+
+        if item_file_id:
+            path_to_file_id[item_file_id] = final_file_id
+
+        normalized_outputs.append(
+            {
+                "file_id": final_file_id,
+                "filename": final_filename,
+            }
+        )
+
+        for raw_path in raw_paths:
+            stripped = raw_path.strip()
+            if stripped:
+                path_to_file_id[stripped] = final_file_id
+                path_to_file_id[stripped.lstrip("/")] = final_file_id
+        path_to_file_id[normalized_relative_path] = final_file_id
+        path_to_file_id[f"/{normalized_relative_path}"] = final_file_id
+
+        path_to_file_id[f"preview/{normalized_relative_path}"] = final_file_id
+        path_to_file_id[f"/preview/{normalized_relative_path}"] = final_file_id
+        path_to_file_id[f"uploads/{normalized_relative_path}"] = final_file_id
+        path_to_file_id[f"/uploads/{normalized_relative_path}"] = final_file_id
+
+        normalized_parts = Path(normalized_relative_path).parts
+        if normalized_parts and normalized_parts[0].startswith("user_"):
+            without_user = "/".join(normalized_parts[1:])
+            if without_user:
+                path_to_file_id[without_user] = final_file_id
+                path_to_file_id[f"/{without_user}"] = final_file_id
+                path_to_file_id[f"preview/{without_user}"] = final_file_id
+                path_to_file_id[f"/preview/{without_user}"] = final_file_id
+                path_to_file_id[f"uploads/{without_user}"] = final_file_id
+                path_to_file_id[f"/uploads/{without_user}"] = final_file_id
+
+    if changed:
+        db.commit()
+
+    return normalized_outputs, path_to_file_id
+
+
+def _rewrite_links_in_payload(payload: Any, path_to_file_id: Dict[str, str]) -> Any:
+    if isinstance(payload, str):
+        return _rewrite_file_links_to_file_id(payload, path_to_file_id)
+    if isinstance(payload, list):
+        return [_rewrite_links_in_payload(item, path_to_file_id) for item in payload]
+    if isinstance(payload, dict):
+        return {
+            key: _rewrite_links_in_payload(value, path_to_file_id)
+            for key, value in payload.items()
+        }
+    return payload
 
 
 async def execute_task_background(
@@ -147,6 +497,15 @@ async def execute_task_background(
                 db_session=db,
             )
 
+        normalized_outputs, path_to_file_id = _normalize_file_outputs(
+            db,
+            task_id=int(task_id),
+            task_user_id=int(cast(Any, task.user_id)),
+            file_outputs=result.get("file_outputs", []),
+        )
+        if normalized_outputs:
+            result["file_outputs"] = normalized_outputs
+
         # Get AI response
         chat_response = result.get("chat_response")
         if isinstance(chat_response, dict):
@@ -163,6 +522,12 @@ async def execute_task_background(
                     timeout_manager.add_task(task_id, int(timeout_seconds))
         else:
             ai_response = result.get("output", "Task completed")
+
+        # Rewrite file links to file_id
+        ai_response = _rewrite_file_links_to_file_id(
+            ai_response,
+            path_to_file_id,
+        )
 
         # Task execution result is logged by ConsoleTraceHandler, no need for duplicate logs
 
@@ -269,6 +634,15 @@ async def execute_continuation_background(
             # Call continuation
             result = await dag_pattern.handle_continuation(user_message, context)
 
+        normalized_outputs, path_to_file_id = _normalize_file_outputs(
+            db,
+            task_id=int(task_id),
+            task_user_id=int(cast(Any, task.user_id)),
+            file_outputs=result.get("file_outputs", []),
+        )
+        if normalized_outputs:
+            result["file_outputs"] = normalized_outputs
+
         # Get AI response
         chat_response = result.get("chat_response")
         if isinstance(chat_response, dict):
@@ -277,6 +651,12 @@ async def execute_continuation_background(
             )
         else:
             ai_response = result.get("output", "Task continuation completed")
+
+        # Rewrite file links to file_id
+        ai_response = _rewrite_file_links_to_file_id(
+            ai_response,
+            path_to_file_id,
+        )
 
         # Update task status (get new session to avoid expiration)
         from ..models.database import get_db
@@ -415,6 +795,49 @@ background_task_manager = BackgroundTaskManager()
 ws_router = APIRouter()
 
 
+@ws_router.get("/preview/{legacy_path:path}", response_model=None)
+async def redirect_legacy_preview(
+    legacy_path: str,
+    db: Session = Depends(get_db),
+) -> Any:
+    resolved_info = _resolve_legacy_preview_storage_path(legacy_path)
+    if resolved_info is None:
+        raise HTTPException(status_code=404, detail="Legacy preview target not found")
+
+    resolved_path, relative_path = resolved_info
+    file_record = (
+        db.query(UploadedFile)
+        .filter(UploadedFile.storage_path == str(resolved_path))
+        .first()
+    )
+
+    if file_record is None:
+        owner_info = _infer_owner_from_relative_path(db, relative_path)
+        if owner_info is None:
+            raise HTTPException(
+                status_code=404, detail="Cannot infer owner for legacy preview path"
+            )
+
+        owner_user_id, task_id = owner_info
+        file_record = UploadedFile(
+            file_id=_build_output_file_id(relative_path),
+            user_id=owner_user_id,
+            task_id=task_id,
+            filename=resolved_path.name,
+            storage_path=str(resolved_path),
+            mime_type=None,
+            file_size=int(resolved_path.stat().st_size),
+        )
+        db.add(file_record)
+        db.commit()
+        db.refresh(file_record)
+
+    return RedirectResponse(
+        url=f"/api/files/public/preview/{file_record.file_id}",
+        status_code=307,
+    )
+
+
 # Connection manager
 class ConnectionManager:
     def __init__(self) -> None:
@@ -490,6 +913,7 @@ async def handle_file_upload_for_task(
         import tempfile
         from pathlib import Path
 
+        from ..models.uploaded_file import UploadedFile
         from .chat import get_agent_manager
 
         uploaded_files = []
@@ -547,15 +971,35 @@ async def handle_file_upload_for_task(
                 # Use normalized filename instead of original
                 original_file_name = Path(file_name).name
                 normalized_file_name = normalize_filename(original_file_name)
-                target_path = target_dir / normalized_file_name
+                target_path = build_unique_target_path(target_dir, normalized_file_name)
 
                 # Copy file to workspace
                 shutil.copy2(temp_file_path, target_path)
                 uploaded_files.append(str(target_path))
 
+                if user is None:
+                    raise ValueError("Authenticated user is required for file upload")
+
+                file_record = UploadedFile(
+                    user_id=int(cast(Any, user.id)),
+                    task_id=task_id,
+                    filename=normalized_file_name,
+                    storage_path=str(target_path),
+                    mime_type=file_type,
+                    file_size=int(file_size),
+                )
+                db.add(file_record)
+                db.flush()
+
+                if agent_service.workspace:
+                    agent_service.workspace.register_file(
+                        str(target_path), file_id=str(file_record.file_id)
+                    )
+
                 # Build file info using normalized filename
                 file_info_list.append(
                     {
+                        "file_id": file_record.file_id,
                         "name": normalized_file_name,
                         "original_name": original_file_name,
                         "size": file_size,
@@ -575,6 +1019,7 @@ async def handle_file_upload_for_task(
                     logger.info(f"🗑️ Cleaned up temp file: {temp_file_path}")
 
         logger.info(f"🎉 File upload completed, uploaded {len(uploaded_files)} files")
+        db.commit()
         return {"uploaded_files": uploaded_files, "file_info_list": file_info_list}
 
     except Exception as e:
@@ -1135,10 +1580,16 @@ async def handle_execute_task(
             # Note: trace_task_completion is handled by handle_chat_message to avoid duplicates
 
             # Extract file output info
-            file_outputs = result.get("file_outputs", [])
-            # Convert to list if file_outputs is string
-            if isinstance(file_outputs, str):
-                file_outputs = [file_outputs] if file_outputs.strip() else []
+            file_outputs, path_to_file_id = _normalize_file_outputs(
+                db,
+                task_id=int(task_id),
+                task_user_id=int(cast(Any, task.user_id)),
+                file_outputs=result.get("file_outputs", []),
+            )
+            result["output"] = _rewrite_file_links_to_file_id(
+                result.get("output", ""),
+                path_to_file_id,
+            )
 
             # Send task completion event (don't duplicate result as trace system already sent)
             await manager.broadcast_to_task(
@@ -1278,8 +1729,39 @@ async def send_historical_data_as_stream(
             # Merge all time-sensitive events and sort by timestamp
             historical_events = []
 
-            # Add unified trace events
+            historical_path_to_file_id: Dict[str, str] = {}
+            normalized_trace_data_by_event_id: Dict[str, Any] = {}
+            task_user_id = int(cast(Any, task.user_id))
+
             for trace_event in trace_events:
+                normalized_event_data = trace_event.data
+                if isinstance(trace_event.data, dict):
+                    normalized_event_data = dict(trace_event.data)
+                    normalized_outputs, path_to_file_id = _normalize_file_outputs(
+                        db,
+                        task_id=task_id,
+                        task_user_id=task_user_id,
+                        file_outputs=normalized_event_data.get("file_outputs", []),
+                    )
+                    if normalized_outputs:
+                        normalized_event_data["file_outputs"] = normalized_outputs
+                    if path_to_file_id:
+                        historical_path_to_file_id.update(path_to_file_id)
+                normalized_trace_data_by_event_id[str(trace_event.event_id)] = (
+                    normalized_event_data
+                )
+
+            for trace_event in trace_events:
+                normalized_event_data = normalized_trace_data_by_event_id.get(
+                    str(trace_event.event_id), trace_event.data
+                )
+                if historical_path_to_file_id and isinstance(
+                    normalized_event_data, dict
+                ):
+                    normalized_event_data = _rewrite_links_in_payload(
+                        normalized_event_data,
+                        historical_path_to_file_id,
+                    )
                 historical_events.append(
                     {
                         "type": "trace_event",
@@ -1288,7 +1770,7 @@ async def send_historical_data_as_stream(
                             "event_type": trace_event.event_type,
                             "step_id": trace_event.step_id,
                             "parent_event_id": trace_event.parent_event_id,
-                            "data": trace_event.data,
+                            "data": normalized_event_data,
                         },
                         "timestamp": safe_timestamp_to_unix(trace_event.timestamp)
                         if trace_event.timestamp
@@ -2041,6 +2523,8 @@ async def handle_build_preview_execution(
                 import tempfile
                 from pathlib import Path
 
+                from ..models.uploaded_file import UploadedFile
+
                 for file_info in files_data:
                     file_name = file_info.get("name", "unknown")
                     file_size = file_info.get("size", 0)
@@ -2090,14 +2574,33 @@ async def handle_build_preview_execution(
                         # Normalize filename
                         original_file_name = Path(file_name).name
                         normalized_file_name = normalize_filename(original_file_name)
-                        target_path = target_dir / normalized_file_name
+                        target_path = build_unique_target_path(
+                            target_dir, normalized_file_name
+                        )
 
                         # Copy file to workspace
                         shutil.copy2(temp_file_path, target_path)
                         uploaded_files.append(str(target_path))
 
+                        file_record = UploadedFile(
+                            user_id=int(cast(Any, user.id)),
+                            task_id=None,
+                            filename=normalized_file_name,
+                            storage_path=str(target_path),
+                            mime_type=file_type,
+                            file_size=int(file_size),
+                        )
+                        db.add(file_record)
+                        db.flush()
+
+                        if agent_service.workspace:
+                            agent_service.workspace.register_file(
+                                str(target_path), file_id=str(file_record.file_id)
+                            )
+
                         file_info_list.append(
                             {
+                                "file_id": file_record.file_id,
                                 "name": normalized_file_name,
                                 "original_name": original_file_name,
                                 "size": file_size,
@@ -2128,6 +2631,7 @@ async def handle_build_preview_execution(
                 logger.info(
                     f"🎉 File upload completed, uploaded {len(uploaded_files)} files"
                 )
+                db.commit()
 
             except Exception as e:
                 logger.error(
